@@ -39,10 +39,17 @@ import sklearn.cross_decomposition as skcd
 from aiohttp import web
 
 # --- datasets ---
-sys.path.append("bciflow/")
-from bciflow.datasets import mengu
+HAVE_DATASET = True
+try:
+    sys.path.append("bciflow/")
+    from bciflow.datasets import mengu
+except Exception:
+    HAVE_DATASET = False
+    mengu = None
 
-# === EEG (BrainFlow opcional) ===
+
+
+# === EEG ===
 try:
     from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
     HAVE_BRAINFLOW = True
@@ -341,11 +348,11 @@ def _classify_epoch_with_main_alg(X_epoch, sfreq, total_time):
     return pred_label, pred_hz, dt
 
 
-# ========= OFFLINE (benchmark estilo do amigo) =========
+# ========= OFFLINE =========
 
 def _filter_by_targets_and_window(dataset, targets_range, t1_samples):
     """
-    Filtro 'à la amigo':
+    Filtro:
       - Mantém apenas trials cujo y ∈ [targets_range[0], targets_range[1]] (inclusive)
       - Corta o sinal no intervalo [0:t1_samples] (amostras desde o início)
     Retorna X_filt (T, B, C, S’), y_filt
@@ -374,7 +381,7 @@ def _classify_block_pls_or_cca(X_block, sfreq, total_time, targets, num_harmonic
     else:
         targets = np.asarray(targets, dtype=float)
 
-    # Pré-computa templates com pesos 'flat' (como no código do amigo)
+    # Pré-computa templates com pesos 'flat'
     Y_list = []
     for f in targets:
         Y = build_target(float(f), sfreq, total_time, num_harmonics=num_harmonics, weight_scheme="flat")
@@ -420,17 +427,14 @@ def offline_benchmark(
     alg=ALG,
     verbose=True,
 ):
-    """
-    Executa o mesmo experimento do seu amigo:
-      - Para cada (subject, depth):
-          - Para cada janela de alvos contíguos [i, i+targets_window-1] dentro de 1..60
-          - Para cada janela de tempo [0..N] amostras (N em 'time_windows_samples')
-        => roda PLS/CCA, mede acurácia e tempo médio, salva CSV por par (subject, depth).
-    """
     try:
         import pandas as pd
     except Exception:
         pd = None
+
+    if not HAVE_DATASET:
+        print("[offline] ERRO: 'bciflow' ausente. Baixe os dados ou rode em modo BrainFlow (--source brainflow).")
+        return
 
     if subjects is None:
         subjects = list(range(19, 31))
@@ -439,7 +443,6 @@ def offline_benchmark(
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # janelas de alvo contíguas EXACTAS como no amigo: 1..60
     fmin_off, fmax_off = 1, 60
     targets_ranges = [(i, i + targets_window - 1) for i in range(fmin_off, fmax_off - targets_window + 2)]
 
@@ -447,7 +450,14 @@ def offline_benchmark(
         for depth in depths:
             if verbose:
                 print(f"\n[offline] Subject {subj} | depth={depth} | alg={alg}")
-            dataset = mengu(subject=subj, path="data/ssvep/", depth=[depth])
+
+            # Carrega dataset com tratamento de erro compreensível
+            try:
+                dataset = mengu(subject=subj, path="data/ssvep/", depth=[depth])
+            except Exception as e:
+                print(f"[offline] PULANDO subject={subj}, depth={depth}: {e}")
+                continue
+
             dataset = _normalize_to_4d(dataset)
             dataset = channel_selection(dataset, channels_sel)
 
@@ -487,7 +497,6 @@ def offline_benchmark(
                         "channels": ",".join(channels_sel),
                     })
 
-            # salva um CSV por (subject, depth), como o do amigo
             if rows:
                 if pd is not None:
                     df = pd.DataFrame(rows)
@@ -502,13 +511,25 @@ def offline_benchmark(
                     print(f"[offline] JSONL salvo: {out_path}")
 
 
+
 # ========= produtores (stream) =========
 
 async def producer_task_dataset(app):
     """
     Lê o dataset Mengu e emite chunks por WS, trial por trial.
+    - Falha de forma amigável se o pacote/arquivos do dataset não estiverem disponíveis.
     """
-    dataset = mengu(subject=SUBJECT, path="data/ssvep/", depth=[DEPTH])
+    if not HAVE_DATASET:
+        print("[dataset] ERRO: 'bciflow' ausente. Use --source brainflow ou instale o dataset.")
+        return
+
+    try:
+        dataset = mengu(subject=SUBJECT, path="data/ssvep/", depth=[DEPTH])
+    except Exception as e:
+        print(f"[dataset] ERRO ao carregar dados: {e}\n"
+              f"Coloque os arquivos em data/ssvep/ ou rode com --source brainflow.")
+        return
+
     dataset = _normalize_to_4d(dataset)
     dataset = channel_selection(dataset, CHANNELS_SELECTED)
 
@@ -516,7 +537,7 @@ async def producer_task_dataset(app):
     global TARGET_FREQS, LABEL_FROM_FREQ
     TARGET_FREQS, LABEL_FROM_FREQ = infer_target_freqs_from_y(
         dataset.get("y", []), min_hz=MIN_HZ, max_hz=MAX_HZ, grid_step=FREQ_GRID_STEP
-   )
+    )
     print(f"[Freqs] TARGET_FREQS ({len(TARGET_FREQS)}): {TARGET_FREQS}")
     print(f"[Freqs] LABEL_FROM_FREQ pronto")
 
@@ -528,7 +549,7 @@ async def producer_task_dataset(app):
     chunk_len = max(1, int(sfreq * (CHUNK_MS/1000)))
 
     for t in range(T):
-        # ground truth JIT do trial inteiro
+        # ground truth JIT do trial inteiro (opcional)
         X_trial_full = X[t, 0, :, :]      # (C,S)
         S_full = X_trial_full.shape[1]
         try:
@@ -576,6 +597,7 @@ async def producer_task_dataset(app):
         await queue.put(end_msg)
 
     print("[Producer] dataset encerrado")
+
 
 
 async def producer_task_brainflow(app):
@@ -787,7 +809,6 @@ if __name__ == "__main__":
     mode = sys.argv[1] if (len(sys.argv) > 1 and sys.argv[1] in ("stream", "offline")) else "stream"
 
     if mode == "offline":
-        # Novo OFFLINE "igual ao do amigo"
         subjects = None           # ex.: "19-30" ou "19,20,21"
         depths = None             # ex.: "high,low"
         targets_window = 16
@@ -817,7 +838,9 @@ if __name__ == "__main__":
                 offline_alg = args[i+1].lower(); i += 2
             else:
                 i += 1
-
+        if not HAVE_DATASET:
+            print("[offline] ERRO: 'bciflow' ausente. Baixe os dados ou rode em modo BrainFlow (--source brainflow).")
+            sys.exit(1)
         offline_benchmark(
             subjects=subjects, depths=depths,
             channels_sel=CHANNELS_SELECTED,
