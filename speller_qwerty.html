@@ -1,0 +1,241 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SSVEP – QWERTY Speller (Responsivo)</title>
+<style>
+  :root{
+    --bg:#0a0b0e; --grid:#3c4147; --tile:#4a5159; --tileOn:#f1f5f9; --ink:#e9eef3;
+    --pred:#60a5fa; --sel:#22c55e; --muted:#9aa4ad;
+    --bw: clamp(2px,0.7vmin,6px);   /* largura de borda responsiva */
+    --barH: 56px;                   /* ajustada via JS */
+    --fsKey: 32px;                  /* fonte das teclas (ajustada via JS) */
+  }
+  *{ box-sizing:border-box }
+  html,body{ height:100%; margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; overflow:hidden; }
+  #bar{
+    display:flex; align-items:center; gap:12px; padding:10px 12px;
+    border-bottom:1px solid #222831; flex-wrap:wrap;
+  }
+  #out{ font-weight:700; letter-spacing:.06em }
+  #typed{ display:inline-block; min-width:10ch; word-break:break-all }
+  .pill{ border:1px solid #2a3138; background:#0e1216; border-radius:999px; padding:4px 8px; color:var(--muted); font-size:12px }
+  button{ background:#141a20; color:var(--ink); border:1px solid #26303a; padding:7px 12px; border-radius:8px; cursor:pointer }
+  button:disabled{ opacity:.5; cursor:default }
+  #stage{ color:var(--muted); font-size:12px }
+  #kbd{
+    width:100vw;
+    height:calc(100vh - var(--barH));
+    margin:0;
+    display:grid; grid-template-rows:repeat(4,1fr);
+    border:var(--bw) solid var(--grid); border-radius:8px; overflow:hidden;
+  }
+  .row{ display:grid; grid-template-columns:repeat(10,1fr); border-top:var(--bw) solid var(--grid) }
+  .row:first-child{ border-top:0 }
+  .key{
+    display:grid; place-items:center; user-select:none; cursor:pointer;
+    background:var(--tile); color:#fff; font-weight:700; letter-spacing:1px;
+    border-left:var(--bw) solid var(--grid);
+    transition:filter .06s linear, transform .06s ease, background .06s linear, color .06s;
+    font-size:var(--fsKey);
+  }
+  .key:first-child{ border-left:0 }
+  .key.on{ background:var(--tileOn); color:#111 }
+  .key.pred{ outline:calc(var(--bw)*2) solid var(--pred); outline-offset:calc(-1*var(--bw)) }
+  .key.sel{ outline:calc(var(--bw)*2) solid var(--sel); outline-offset:calc(-1*var(--bw)) }
+  #hud{ position:fixed; left:12px; bottom:10px; display:flex; gap:8px; flex-wrap:wrap; color:var(--muted); font-size:12px }
+</style>
+
+<div id="bar">
+  <div id="out">&gt; <span id="typed"></span></div>
+  <button id="bStart">Start</button>
+  <button id="bStop" disabled>Stop</button>
+  <button id="bFS">Tela Cheia</button>
+  <span class="pill">WS: <span id="ws">desconectado</span></span>
+  <span class="pill">FPS: <span id="fps">…</span></span>
+  <span class="pill">Confirmação: 1.2 s</span>
+  <span class="pill">Refratário: 0.8 s</span>
+  <span id="stage" class="pill">Fase: escolher <b>linha</b></span>
+</div>
+
+<div id="kbd"></div>
+<div id="hud"></div>
+
+<script>
+/* ===== Layout ===== */
+const ROWS = [
+  ["1","2","3","4","5","6","7","8","9","0"],
+  ["Q","W","E","R","T","Y","U","I","O","P"],
+  ["A","S","D","F","G","H","J","K","L","\u2190"],
+  ["Z","X","C","V","B","N","M",",","."]
+];
+
+/* ===== Parâmetros ===== */
+const STABLE_MS = 1200, REFRACTORY_MS = 800, REL_TOL = 0.08;
+let FPS = 60;
+const ROW_PERIODS = [12, 8, 6, 4];          // ≈ [5, 7.5, 10, 15] Hz
+const KEY_PERIODS = [2,3,4,5,6,7,8,9,10,11];// até 10 teclas/linha
+
+/* ===== Estado ===== */
+const typedEl = document.getElementById('typed');
+const kbd = document.getElementById('kbd');
+const wsStateEl = document.getElementById('ws');
+const fpsEl = document.getElementById('fps');
+const stageEl = document.getElementById('stage');
+const hud = document.getElementById('hud');
+
+let tiles=[], anim=0, running=false, ws=null, stage="row", rowIdx=0;
+let lastGuess=null, stableSince=0, refractoryUntil=0;
+
+/* ===== Construção ===== */
+function buildKeyboard(){
+  kbd.innerHTML=''; tiles=[];
+  for(let r=0;r<ROWS.length;r++){
+    const row=document.createElement('div'); row.className='row';
+    const cols=ROWS[r]; const N=Math.max(10,cols.length);
+    row.style.gridTemplateColumns=`repeat(${N},1fr)`;
+    for(let c=0;c<N;c++){
+      const lab=cols[c]??''; const key=document.createElement('div');
+      key.className='key'; key.textContent=lab;
+      row.appendChild(key);
+      tiles.push({el:key,row:r,col:c,label:lab,period:0,frame:0,active:false});
+      key.onclick=()=>{ if(!lab) return; if(stage==="row") enterKeyStage(r); else if(stage==="key"&&r===rowIdx&&c<ROWS[rowIdx].length) confirmSelection(lab); };
+    }
+    kbd.appendChild(row);
+  }
+  reflow();
+}
+
+/* ===== Responsividade ===== */
+function reflow(){
+  document.documentElement.style.setProperty('--barH', document.getElementById('bar').offsetHeight+'px');
+  // mede o 1º bloco visível para ajustar fonte
+  const any = kbd.querySelector('.key');
+  if(any){
+    const fs = Math.max(18, Math.min(any.clientWidth, any.clientHeight) * 0.55);
+    document.documentElement.style.setProperty('--fsKey', fs+'px');
+  }
+}
+window.addEventListener('resize', reflow);
+
+/* ===== FPS ===== */
+function measureFPS(durationMs=900){
+  return new Promise(resolve=>{
+    let frames=0, t0=null;
+    const tick=(t)=>{ if(t0===null)t0=t; frames++; (t-t0<durationMs)?requestAnimationFrame(tick):resolve(frames*1000/(t-t0)); };
+    requestAnimationFrame(tick);
+  });
+}
+
+/* ===== Fases ===== */
+function enterRowStage(){
+  stage="row"; stageEl.innerHTML='Fase: escolher <b>linha</b>';
+  lastGuess=null; stableSince=0;
+  for(const t of tiles){
+    t.active=(t.col < ROWS[t.row].length);
+    t.period=ROW_PERIODS[t.row]||ROW_PERIODS.at(-1);
+    t.frame=0; t.el.classList.remove('pred','sel','on');
+  }
+  reflow();
+}
+function enterKeyStage(r){
+  rowIdx=r; stage="key"; stageEl.innerHTML=`Fase: escolher <b>tecla</b> — linha ${r+1}`;
+  lastGuess=null; stableSince=0;
+  for(const t of tiles){
+    const inRow=(t.row===r)&&(t.col<ROWS[r].length);
+    t.active=inRow; t.period=inRow?(KEY_PERIODS[t.col]||KEY_PERIODS.at(-1)):0;
+    t.frame=0; if(!inRow) t.el.classList.remove('pred','sel','on');
+  }
+  reflow();
+}
+
+/* ===== Animação ===== */
+function loop(){
+  for(const t of tiles){
+    if(!t.active||!t.period){ t.el.classList.remove('on'); continue; }
+    t.frame=(t.frame+1)%t.period;
+    t.el.classList.toggle('on', t.frame < Math.floor(t.period/2));
+  }
+  anim=requestAnimationFrame(loop);
+}
+
+/* ===== WebSocket ===== */
+function connectWS(){
+  ws=new WebSocket("ws://127.0.0.1:8082/events");
+  ws.onopen =()=> wsStateEl.textContent="conectado";
+  ws.onclose=()=> wsStateEl.textContent="desconectado";
+  ws.onmessage=(ev)=>{
+    const msg=JSON.parse(ev.data);
+    if(msg.type!=="prediction") return;
+    const predHz=Number(msg.pred_hz ?? msg.pred ?? NaN);
+    if(!isFinite(predHz)) return;
+    handlePrediction(predHz);
+  };
+}
+
+/* ===== Matching de frequência ===== */
+function handlePrediction(predHz){
+  const now=performance.now(); if(now<refractoryUntil) return;
+  let best=null, bestDiff=Infinity;
+  for(const t of tiles){
+    if(!t.active||!t.period) continue;
+    const f=FPS/t.period, d=Math.abs(predHz - f);
+    if(d<bestDiff){ bestDiff=d; best=t; }
+  }
+  if(!best) return;
+  const fBest=FPS/best.period, ok=(Math.abs(predHz-fBest) <= REL_TOL*fBest);
+  for(const t of tiles){ t.el.classList.toggle('pred', t===best && ok); }
+  const guess = ok ? (stage==="row" ? `row:${best.row}` : best.label) : null;
+
+  if(guess && guess===lastGuess){
+    if(!stableSince) stableSince=now;
+    if(now-stableSince >= STABLE_MS){
+      if(stage==="row") enterKeyStage(best.row);
+      else confirmSelection(best.label);
+      refractoryUntil=now+REFRACTORY_MS; stableSince=0; lastGuess=null;
+    }
+  }else{ lastGuess=guess; stableSince=guess?now:0; }
+}
+
+/* ===== Seleção ===== */
+function confirmSelection(label){
+  const t=tiles.find(x=>x.active&&x.label===label&&x.row===rowIdx);
+  if(t){ t.el.classList.add('sel'); setTimeout(()=>t.el.classList.remove('sel'), 400); }
+  if(label==="\u2190") typedEl.textContent=typedEl.textContent.slice(0,-1);
+  else typedEl.textContent+=label;
+  enterRowStage();
+}
+
+/* ===== Controles ===== */
+async function start(){
+  if(running) return; running=true;
+  bStart.disabled=true; bStop.disabled=false;
+  FPS=Math.round(await measureFPS(900)); fpsEl.textContent=FPS.toString();
+  enterRowStage(); loop(); if(!ws || ws.readyState>1) connectWS();
+  updateHUD();
+}
+function stop(){
+  if(!running) return; running=false;
+  cancelAnimationFrame(anim); bStart.disabled=false; bStop.disabled=true;
+  for(const t of tiles){ t.el.classList.remove('on','pred','sel'); t.active=false; t.period=0; }
+}
+function updateHUD(){
+  hud.innerHTML='';
+  const mk=txt=>{ const s=document.createElement('span'); s.className='pill'; s.textContent=txt; return s; };
+  hud.append(mk(`Linhas (Hz): ${ROW_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ')}`));
+  hud.append(mk(`Teclas (Hz): ${KEY_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ')}`));
+}
+
+const bStart=document.getElementById('bStart');
+const bStop =document.getElementById('bStop');
+bStart.onclick=start; bStop.onclick=stop;
+
+// Tela cheia
+document.getElementById('bFS').onclick=()=>{
+  const el=document.documentElement;
+  if(!document.fullscreenElement) el.requestFullscreen?.();
+  else document.exitFullscreen?.();
+};
+
+// boot
+buildKeyboard(); reflow();
+</script>

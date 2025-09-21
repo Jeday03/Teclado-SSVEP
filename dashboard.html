@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>SSVEP – Classificação em tempo real</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 20px; }
+  .ok { color: green; }
+  .bad { color: red; }
+  pre { background: #f6f6f6; padding: 12px; border-radius: 8px; }
+</style>
+
+<h1>SSVEP – Classificação em tempo real</h1>
+<p>Status: <span id="status">conectando…</span></p>
+<div id="log"></div>
+
+<script>
+const log = (html) => {
+  const div = document.getElementById('log');
+  const el = document.createElement('div');
+  el.innerHTML = html;
+  div.prepend(el);
+};
+
+const ws = new WebSocket("ws://127.0.0.1:8082/events");
+ws.onopen = () => document.getElementById('status').textContent = "conectado";
+ws.onclose = () => document.getElementById('status').textContent = "desconectado";
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+
+  if (msg.type === "prediction") {
+    // pegue os limites da janela enviados pelo Python
+    const a0 = (msg.window && typeof msg.window.start === "number") ? msg.window.start : 0;
+    const a1 = (msg.window && typeof msg.window.end   === "number") ? msg.window.end   : msg.samples_used;
+    const n  = (typeof msg.samples_used === "number") ? msg.samples_used : (a1 - a0);
+
+    const ms0 = Math.round(a0 / msg.sfreq * 1000);
+    const ms1 = Math.round(a1 / msg.sfreq * 1000);
+
+    const ok = (msg.pred === msg.label_true);
+
+    log(`<pre>
+trial: ${msg.trial}
+amostras usadas: ${a0} a ${a1} (n=${n})
+predição: <b class="${ok ? 'ok' : 'bad'}">${msg.pred}</b>  |  verdadeiro: ${msg.label_true}
+alg: ${msg.alg} | harmônicos: ${msg.num_harmonics} | latência: ${Number(msg.latency_s).toFixed(4)}s
+</pre>`);
+  } else if (msg.type === "end_trial") {
+    log(`<b>Fim do trial ${msg.trial}</b>`);
+  } else if (msg.type === "end_dataset") {
+    log(`<b>Fim do dataset</b>`);
+  }
+};
+</script>
+
