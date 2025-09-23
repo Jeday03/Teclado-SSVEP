@@ -52,8 +52,9 @@
   <button id="bFS">Tela Cheia</button>
   <span class="pill">WS: <span id="ws">desconectado</span></span>
   <span class="pill">FPS: <span id="fps">…</span></span>
-  <span class="pill">Confirmação: 1.2 s</span>
-  <span class="pill">Refratário: 0.8 s</span>
+  <span class="pill">Conf. (L/T): 1.0/0.9 s</span>
+  <span class="pill">Tol. (L/T): 8%/12%</span>
+  <span class="pill">Refr.: 0.8 s</span>
   <span id="stage" class="pill">Fase: escolher <b>linha</b></span>
 </div>
 
@@ -68,15 +69,25 @@ const ROWS = [
   ["A","S","D","F","G","H","J","K","L","\u2190"],
   ["Z","X","C","V","B","N","M",",","."]
 ];
+const MAX_COLS = Math.max(...ROWS.map(r=>r.length));
 
-/* ===== Parâmetros ===== */
-const STABLE_MS = 1200, REFRACTORY_MS = 800, REL_TOL = 0.08;
-const MIN_HZ = 5, MAX_HZ = 40;
+/* ===== Parâmetros (estabilidade por fase + limites de Hz) ===== */
+const STABLE_MS_ROW = 1000;      // linha precisa ficar estável por 1.0 s
+const STABLE_MS_KEY =  900;      // tecla precisa ficar estável por 0.9 s
+const REFRACTORY_MS = 800;       // pós-seleção
+const REL_TOL_ROW   = 0.08;      // ±8% na 1ª fase (linha)
+const REL_TOL_KEY   = 0.12;      // ±12% na 2ª fase (tecla)
+const MIN_FREQ = 5;              // não usar < 5 Hz
+const MAX_FREQ = 40;             // não passar de 40 Hz
+
+/* ===== Fases – períodos base das linhas (em frames) =====
+   Para FPS≈60 => [12, 8, 6, 4] ≈ [5, 7.5, 10, 15] Hz. */
 let FPS = 60;
+const ROW_PERIODS = [12, 8, 6, 4];
 
-/* Períodos-base */
-let ROW_PERIODS = [12, 8, 6, 4];      // ≈ [5, 7.5, 10, 15] @60Hz
-let KEY_PERIODS = [];                  // vai ser definido em start()
+/* Períodos de tecla serão calculados após medir FPS
+   garantindo 5–40 Hz independentemente do monitor. */
+let KEY_PERIODS = [];
 
 /* ===== Estado ===== */
 const typedEl = document.getElementById('typed');
@@ -94,14 +105,17 @@ function buildKeyboard(){
   kbd.innerHTML=''; tiles=[];
   for(let r=0;r<ROWS.length;r++){
     const row=document.createElement('div'); row.className='row';
-    const cols=ROWS[r]; const N=Math.max(10,cols.length);
+    const cols=ROWS[r]; const N=Math.max(MAX_COLS,cols.length);
     row.style.gridTemplateColumns=`repeat(${N},1fr)`;
     for(let c=0;c<N;c++){
       const lab=cols[c]??''; const key=document.createElement('div');
       key.className='key'; key.textContent=lab;
       row.appendChild(key);
       tiles.push({el:key,row:r,col:c,label:lab,period:0,frame:0,active:false});
-      key.onclick=()=>{ if(!lab) return; if(stage==="row") enterKeyStage(r); else if(stage==="key"&&r===rowIdx&&c<ROWS[rowIdx].length) confirmSelection(lab); };
+      key.onclick=()=>{ if(!lab) return;
+        if(stage==="row") enterKeyStage(r);
+        else if(stage==="key"&&r===rowIdx&&c<ROWS[rowIdx].length) confirmSelection(lab);
+      };
     }
     kbd.appendChild(row);
   }
@@ -128,20 +142,17 @@ function measureFPS(durationMs=900){
   });
 }
 
-/* ===== Utilitários de frequência ===== */
-function insideRange(f){ return f>=MIN_HZ && f<=MAX_HZ; }
-
-/* Gera exatamente N períodos para teclas de forma que FPS/period ∈ [MIN_HZ, MAX_HZ] */
-function buildKeyPeriods(nKeys){
-  const base = Array.from({length:199}, (_,i)=>i+2);
-  let ps = base.filter(p => insideRange(FPS/p));
-  // se faltar, continua aumentando período até completar N
-  let p = ps.length ? ps[ps.length-1]+1 : Math.max(2, Math.floor(FPS/MAX_HZ));
-  while(ps.length < nKeys && p < 1000){
-    if(insideRange(FPS/p)) ps.push(p);
-    p++;
+/* ===== Cálculo de períodos para TECLAS (garante 5–40 Hz) ===== */
+function computeKeyPeriods(){
+  const pMin = Math.max(2, Math.ceil(FPS / MAX_FREQ));  // menor período permitido
+  const pMax = Math.max(pMin, Math.floor(FPS / MIN_FREQ)); // maior período permitido
+  const out = [];
+  for(let p=pMin; p<=pMax && out.length<MAX_COLS; p++) out.push(p);
+  // fallback (caso extremo de FPS muito baixo/alto): completa com últimos valores
+  while(out.length < MAX_COLS){
+    out.push(out.length ? out[out.length-1]+1 : pMin);
   }
-  return ps.slice(0, nKeys);
+  return out;
 }
 
 /* ===== Fases ===== */
@@ -153,17 +164,18 @@ function enterRowStage(){
     t.period=ROW_PERIODS[t.row]||ROW_PERIODS.at(-1);
     t.frame=0; t.el.classList.remove('pred','sel','on');
   }
-  reflow();
+  reflow(); updateHUD();
 }
 function enterKeyStage(r){
   rowIdx=r; stage="key"; stageEl.innerHTML=`Fase: escolher <b>tecla</b> — linha ${r+1}`;
   lastGuess=null; stableSince=0;
   for(const t of tiles){
     const inRow=(t.row===r)&&(t.col<ROWS[r].length);
-    t.active=inRow; t.period=inRow?(KEY_PERIODS[t.col]||KEY_PERIODS.at(-1)):0;
+    t.active=inRow;
+    t.period=inRow?(KEY_PERIODS[t.col]||KEY_PERIODS.at(-1)):0;
     t.frame=0; if(!inRow) t.el.classList.remove('pred','sel','on');
   }
-  reflow();
+  reflow(); updateHUD();
 }
 
 /* ===== Animação ===== */
@@ -193,6 +205,8 @@ function connectWS(){
 /* ===== Matching de frequência ===== */
 function handlePrediction(predHz){
   const now=performance.now(); if(now<refractoryUntil) return;
+
+  // acha tecla/linha mais próxima
   let best=null, bestDiff=Infinity;
   for(const t of tiles){
     if(!t.active||!t.period) continue;
@@ -200,18 +214,26 @@ function handlePrediction(predHz){
     if(d<bestDiff){ bestDiff=d; best=t; }
   }
   if(!best) return;
-  const fBest=FPS/best.period, ok=(Math.abs(predHz-fBest) <= REL_TOL*fBest);
+
+  const fBest=FPS/best.period;
+  const tol = (stage==="row" ? REL_TOL_ROW : REL_TOL_KEY);
+  const ok  = Math.abs(predHz - fBest) <= tol * fBest;
+
   for(const t of tiles){ t.el.classList.toggle('pred', t===best && ok); }
+
   const guess = ok ? (stage==="row" ? `row:${best.row}` : best.label) : null;
+  const needStable = (stage==="row" ? STABLE_MS_ROW : STABLE_MS_KEY);
 
   if(guess && guess===lastGuess){
     if(!stableSince) stableSince=now;
-    if(now-stableSince >= STABLE_MS){
+    if(now - stableSince >= needStable){
       if(stage==="row") enterKeyStage(best.row);
       else confirmSelection(best.label);
       refractoryUntil=now+REFRACTORY_MS; stableSince=0; lastGuess=null;
     }
-  }else{ lastGuess=guess; stableSince=guess?now:0; }
+  }else{
+    lastGuess=guess; stableSince=guess?now:0;
+  }
 }
 
 /* ===== Seleção ===== */
@@ -231,10 +253,12 @@ async function start(){
   FPS=Math.round(await measureFPS(900));
   fpsEl.textContent=FPS.toString();
 
-  // Garante 5–40 Hz independentemente do FPS do monitor
-  KEY_PERIODS = buildKeyPeriods(10);
+  // calcula períodos de tecla respeitando 5–40 Hz
+  KEY_PERIODS = computeKeyPeriods();
 
-  enterRowStage(); loop(); if(!ws || ws.readyState>1) connectWS();
+  enterRowStage();
+  loop();
+  if(!ws || ws.readyState>1) connectWS();
   updateHUD();
 }
 function stop(){
@@ -242,14 +266,20 @@ function stop(){
   cancelAnimationFrame(anim); bStart.disabled=false; bStop.disabled=true;
   for(const t of tiles){ t.el.classList.remove('on','pred','sel'); t.active=false; t.period=0; }
 }
+function fmtHz(x){ return x.toFixed(2).replace('.',','); }
 function updateHUD(){
   hud.innerHTML='';
   const mk=txt=>{ const s=document.createElement('span'); s.className='pill'; s.textContent=txt; return s; };
-  const rowHz = ROW_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ');
-  const keyHz = KEY_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ');
-  hud.append(mk(`Faixa alvo: ${MIN_HZ}-${MAX_HZ} Hz`));
+
+  // Frequências por linha (estáticas) e por tecla (dinâmicas 5–40 Hz)
+  const rowHz = ROW_PERIODS.map(p => fmtHz(FPS/p)).join(', ');
+  const keyHz = KEY_PERIODS.map(p => fmtHz(FPS/p)).slice(0, MAX_COLS).join(', ');
+
   hud.append(mk(`Linhas (Hz): ${rowHz}`));
   hud.append(mk(`Teclas (Hz): ${keyHz}`));
+  hud.append(mk(`Limites: ${MIN_FREQ}-${MAX_FREQ} Hz`));
+  hud.append(mk(`Tol L/T: ${(REL_TOL_ROW*100)|0}%/${(REL_TOL_KEY*100)|0}%`));
+  hud.append(mk(`Conf L/T: ${(STABLE_MS_ROW/1000).toFixed(1)}s/${(STABLE_MS_KEY/1000).toFixed(1)}s`));
 }
 
 const bStart=document.getElementById('bStart');
