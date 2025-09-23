@@ -147,7 +147,7 @@ SUBJECT = 19
 DEPTH = "high"
 CHANNELS_SELECTED = ["PZ","PO3","PO4","PO5","PO6","POZ","O1","O2","OZ"]
 RAW_TARGET_FS = 512              # None para não reamostrar
-ALG = "pls"                      # "pls" ou "cca"
+ALG = "cca"                      # "pls" ou "cca"
 NUM_HARMONICS = 10
 
 # alvo dinâmico (para RT)
