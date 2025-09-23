@@ -152,9 +152,9 @@ NUM_HARMONICS = 10
 
 # alvo dinâmico (para RT)
 TARGET_FREQS = None              # np.ndarray[float]
-LABEL_FROM_FREQ = None           # callable: float Hz -> label (comparável ao "verdadeiro")
-MIN_HZ, MAX_HZ = 5.0, 60.0
-FREQ_GRID_STEP = 1.0
+LABEL_FROM_FREQ = None           # callable: float Hz -> label
+MIN_HZ, MAX_HZ = 5.0, 40.0
+FREQ_GRID_STEP = 0.25
 
 # ==== CONFIG (janela do classificador) ====
 WINDOW_SEC = 2.0        # tamanho da janela (em segundos)
@@ -610,7 +610,7 @@ async def producer_task_brainflow(app):
 
     params = BrainFlowInputParams()
     params.serial_port = BRAIN_SERIAL_PORT
-    # Se precisar, habilite campos adicionais em BRAIN_OTHER_PARAMS:
+    # Habilite campos adicionais em BRAIN_OTHER_PARAMS se for necessário:
     for k, v in BRAIN_OTHER_PARAMS.items():
         setattr(params, k, v)
 

@@ -71,9 +71,12 @@ const ROWS = [
 
 /* ===== Parâmetros ===== */
 const STABLE_MS = 1200, REFRACTORY_MS = 800, REL_TOL = 0.08;
+const MIN_HZ = 5, MAX_HZ = 40;
 let FPS = 60;
-const ROW_PERIODS = [12, 8, 6, 4];          // ≈ [5, 7.5, 10, 15] Hz
-const KEY_PERIODS = [2,3,4,5,6,7,8,9,10,11];// até 10 teclas/linha
+
+/* Períodos-base */
+let ROW_PERIODS = [12, 8, 6, 4];      // ≈ [5, 7.5, 10, 15] @60Hz
+let KEY_PERIODS = [];                  // vai ser definido em start()
 
 /* ===== Estado ===== */
 const typedEl = document.getElementById('typed');
@@ -108,7 +111,6 @@ function buildKeyboard(){
 /* ===== Responsividade ===== */
 function reflow(){
   document.documentElement.style.setProperty('--barH', document.getElementById('bar').offsetHeight+'px');
-  // mede o 1º bloco visível para ajustar fonte
   const any = kbd.querySelector('.key');
   if(any){
     const fs = Math.max(18, Math.min(any.clientWidth, any.clientHeight) * 0.55);
@@ -124,6 +126,22 @@ function measureFPS(durationMs=900){
     const tick=(t)=>{ if(t0===null)t0=t; frames++; (t-t0<durationMs)?requestAnimationFrame(tick):resolve(frames*1000/(t-t0)); };
     requestAnimationFrame(tick);
   });
+}
+
+/* ===== Utilitários de frequência ===== */
+function insideRange(f){ return f>=MIN_HZ && f<=MAX_HZ; }
+
+/* Gera exatamente N períodos para teclas de forma que FPS/period ∈ [MIN_HZ, MAX_HZ] */
+function buildKeyPeriods(nKeys){
+  const base = Array.from({length:199}, (_,i)=>i+2);
+  let ps = base.filter(p => insideRange(FPS/p));
+  // se faltar, continua aumentando período até completar N
+  let p = ps.length ? ps[ps.length-1]+1 : Math.max(2, Math.floor(FPS/MAX_HZ));
+  while(ps.length < nKeys && p < 1000){
+    if(insideRange(FPS/p)) ps.push(p);
+    p++;
+  }
+  return ps.slice(0, nKeys);
 }
 
 /* ===== Fases ===== */
@@ -209,7 +227,13 @@ function confirmSelection(label){
 async function start(){
   if(running) return; running=true;
   bStart.disabled=true; bStop.disabled=false;
-  FPS=Math.round(await measureFPS(900)); fpsEl.textContent=FPS.toString();
+
+  FPS=Math.round(await measureFPS(900));
+  fpsEl.textContent=FPS.toString();
+
+  // Garante 5–40 Hz independentemente do FPS do monitor
+  KEY_PERIODS = buildKeyPeriods(10);
+
   enterRowStage(); loop(); if(!ws || ws.readyState>1) connectWS();
   updateHUD();
 }
@@ -221,8 +245,11 @@ function stop(){
 function updateHUD(){
   hud.innerHTML='';
   const mk=txt=>{ const s=document.createElement('span'); s.className='pill'; s.textContent=txt; return s; };
-  hud.append(mk(`Linhas (Hz): ${ROW_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ')}`));
-  hud.append(mk(`Teclas (Hz): ${KEY_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ')}`));
+  const rowHz = ROW_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ');
+  const keyHz = KEY_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ');
+  hud.append(mk(`Faixa alvo: ${MIN_HZ}-${MAX_HZ} Hz`));
+  hud.append(mk(`Linhas (Hz): ${rowHz}`));
+  hud.append(mk(`Teclas (Hz): ${keyHz}`));
 }
 
 const bStart=document.getElementById('bStart');
