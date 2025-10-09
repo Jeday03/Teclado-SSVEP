@@ -6,9 +6,9 @@
   :root{
     --bg:#0a0b0e; --grid:#3c4147; --tile:#4a5159; --tileOn:#f1f5f9; --ink:#e9eef3;
     --pred:#60a5fa; --sel:#22c55e; --muted:#9aa4ad;
-    --bw: clamp(2px,0.7vmin,6px);
-    --barH: 56px;
-    --fsKey: 32px;
+    --bw: clamp(2px,0.7vmin,6px);   /* largura de borda responsiva */
+    --barH: 56px;                   /* ajustada via JS */
+    --fsKey: 32px;                  /* fonte das teclas (ajustada via JS) */
   }
   *{ box-sizing:border-box }
   html,body{ height:100%; margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; overflow:hidden; }
@@ -50,10 +50,10 @@
   <button id="bStart">Start</button>
   <button id="bStop" disabled>Stop</button>
   <button id="bFS">Tela Cheia</button>
-  <button id="bMode" title="T para alternar">Modo teste: OFF</button>
   <span class="pill">WS: <span id="ws">desconectado</span></span>
   <span class="pill">FPS: <span id="fps">…</span></span>
-  <span id="gatePill" class="pill"></span>
+  <span class="pill">Confirmação: 1.2 s</span>
+  <span class="pill">Refratário: 0.8 s</span>
   <span id="stage" class="pill">Fase: escolher <b>linha</b></span>
 </div>
 
@@ -69,21 +69,14 @@ const ROWS = [
   ["Z","X","C","V","B","N","M",",","."]
 ];
 
-/* ===== Config de modos ===== */
-const CFG = {
-  strict: { STABLE_MS:1200, REFRACTORY_MS:800, REL_TOL:0.08, AUTO_CONFIRM_DEADLINE_MS: Infinity },
-  loose:  { STABLE_MS: 300, REFRACTORY_MS:250, REL_TOL:0.35, AUTO_CONFIRM_DEADLINE_MS: 1200 }
-};
-let MODE = "strict";
-let STABLE_MS = CFG.strict.STABLE_MS;
-let REFRACTORY_MS = CFG.strict.REFRACTORY_MS;
-let REL_TOL = CFG.strict.REL_TOL;
-let AUTO_CONFIRM_DEADLINE_MS = CFG.strict.AUTO_CONFIRM_DEADLINE_MS;
-
-/* ===== Parâmetros de animação ===== */
+/* ===== Parâmetros ===== */
+const STABLE_MS = 1200, REFRACTORY_MS = 800, REL_TOL = 0.08;
+const MIN_HZ = 5, MAX_HZ = 40;   // limite pedido pelo orientador
 let FPS = 60;
-const ROW_PERIODS = [12, 8, 6, 4];          // ≈ [5, 7.5, 10, 15] Hz (a ~60 fps)
-const KEY_PERIODS = [2,3,4,5,6,7,8,9,10,11];// até 10 teclas/linha
+
+/* Períodos-base (linhas ficam fixas; teclas serão recalculadas por FPS) */
+let ROW_PERIODS = [12, 8, 6, 4];      // ≈ [5, 7.5, 10, 15] @60Hz
+let KEY_PERIODS = [];                  // será definido em start()
 
 /* ===== Estado ===== */
 const typedEl = document.getElementById('typed');
@@ -91,12 +84,10 @@ const kbd = document.getElementById('kbd');
 const wsStateEl = document.getElementById('ws');
 const fpsEl = document.getElementById('fps');
 const stageEl = document.getElementById('stage');
-const gatePill = document.getElementById('gatePill');
 const hud = document.getElementById('hud');
 
 let tiles=[], anim=0, running=false, ws=null, stage="row", rowIdx=0;
-let lastGuess=null, stableSince=0, refractoryUntil=0, stageEnteredAt=0;
-let autoTimer = null;
+let lastGuess=null, stableSince=0, refractoryUntil=0;
 
 /* ===== Construção ===== */
 function buildKeyboard(){
@@ -110,11 +101,7 @@ function buildKeyboard(){
       key.className='key'; key.textContent=lab;
       row.appendChild(key);
       tiles.push({el:key,row:r,col:c,label:lab,period:0,frame:0,active:false});
-      key.onclick=()=>{
-        if(!lab) return;
-        if(stage==="row") enterKeyStage(r);
-        else if(stage==="key"&&r===rowIdx&&c<ROWS[rowIdx].length) confirmSelection(lab);
-      };
+      key.onclick=()=>{ if(!lab) return; if(stage==="row") enterKeyStage(r); else if(stage==="key"&&r===rowIdx&&c<ROWS[rowIdx].length) confirmSelection(lab); };
     }
     kbd.appendChild(row);
   }
@@ -141,70 +128,43 @@ function measureFPS(durationMs=900){
   });
 }
 
-/* ===== Modo ===== */
-function setMode(mode){
-  MODE = mode;
-  ({STABLE_MS, REFRACTORY_MS, REL_TOL, AUTO_CONFIRM_DEADLINE_MS} = CFG[MODE]);
-  document.getElementById('bMode').textContent = `Modo teste: ${MODE==='loose'?'ON':'OFF'}`;
-  gatePill.textContent = `Confirmação: ${STABLE_MS/1000}s • Refratário: ${REFRACTORY_MS/1000}s • Tol: ${(REL_TOL*100)|0}%`;
-}
-function toggleMode(){
-  setMode(MODE==='strict'?'loose':'strict');
-  // reinicia fase para aplicar imediatamente
-  if(stage==='row') enterRowStage(); else enterKeyStage(rowIdx);
+/* ===== Utilitários de frequência ===== */
+function insideRange(f){ return f>=MIN_HZ && f<=MAX_HZ; }
+
+/* Gera exatamente N períodos para teclas de forma que FPS/period ∈ [MIN_HZ, MAX_HZ] */
+function buildKeyPeriods(nKeys){
+  // períodos candidatos amplos (2..200 é mais que suficiente)
+  const base = Array.from({length:199}, (_,i)=>i+2);
+  let ps = base.filter(p => insideRange(FPS/p));
+  // se faltar, continua aumentando período até completar N
+  let p = ps.length ? ps[ps.length-1]+1 : Math.max(2, Math.floor(FPS/MAX_HZ));
+  while(ps.length < nKeys && p < 1000){
+    if(insideRange(FPS/p)) ps.push(p);
+    p++;
+  }
+  return ps.slice(0, nKeys);
 }
 
 /* ===== Fases ===== */
 function enterRowStage(){
   stage="row"; stageEl.innerHTML='Fase: escolher <b>linha</b>';
-  lastGuess=null; stableSince=0; stageEnteredAt=performance.now();
+  lastGuess=null; stableSince=0;
   for(const t of tiles){
     t.active=(t.col < ROWS[t.row].length);
     t.period=ROW_PERIODS[t.row]||ROW_PERIODS.at(-1);
     t.frame=0; t.el.classList.remove('pred','sel','on');
   }
-  scheduleAutoConfirm();
   reflow();
 }
 function enterKeyStage(r){
   rowIdx=r; stage="key"; stageEl.innerHTML=`Fase: escolher <b>tecla</b> — linha ${r+1}`;
-  lastGuess=null; stableSince=0; stageEnteredAt=performance.now();
+  lastGuess=null; stableSince=0;
   for(const t of tiles){
     const inRow=(t.row===r)&&(t.col<ROWS[r].length);
     t.active=inRow; t.period=inRow?(KEY_PERIODS[t.col]||KEY_PERIODS.at(-1)):0;
     t.frame=0; if(!inRow) t.el.classList.remove('pred','sel','on');
   }
-  scheduleAutoConfirm();
   reflow();
-}
-
-/* ===== Auto-confirmação (modo teste) ===== */
-function getActiveTiles(){
-  return tiles.filter(t=>t.active && t.label);
-}
-function randomChoice(arr){
-  return arr[Math.floor(Math.random()*arr.length)];
-}
-function scheduleAutoConfirm(){
-  if(autoTimer){ clearInterval(autoTimer); autoTimer=null; }
-  if(AUTO_CONFIRM_DEADLINE_MS===Infinity) return;
-  autoTimer = setInterval(()=>{
-    if(MODE!=='loose' || !running) return;
-    const now=performance.now();
-    if(now - stageEnteredAt >= AUTO_CONFIRM_DEADLINE_MS){
-      const act = getActiveTiles();
-      if(!act.length) return;
-      // confirma aleatoriamente para demonstrar o fluxo
-      if(stage==='row'){
-        const pick = randomChoice(act);
-        enterKeyStage(pick.row);
-      }else{
-        const inRow = act.filter(t=>t.row===rowIdx);
-        const pick = randomChoice(inRow);
-        confirmSelection(pick.label);
-      }
-    }
-  }, 80);
 }
 
 /* ===== Animação ===== */
@@ -234,19 +194,14 @@ function connectWS(){
 /* ===== Matching de frequência ===== */
 function handlePrediction(predHz){
   const now=performance.now(); if(now<refractoryUntil) return;
-
-  // melhor tile por proximidade
-  let best=null, bestDiff=Infinity, bestF=null;
+  let best=null, bestDiff=Infinity;
   for(const t of tiles){
     if(!t.active||!t.period) continue;
     const f=FPS/t.period, d=Math.abs(predHz - f);
-    if(d<bestDiff){ bestDiff=d; best=t; bestF=f; }
+    if(d<bestDiff){ bestDiff=d; best=t; }
   }
   if(!best) return;
-
-  const withinTol = (Math.abs(predHz-bestF) <= REL_TOL*bestF);
-  const ok = MODE==='loose' ? (withinTol || true) : withinTol; // no modo teste aceita sempre o melhor
-
+  const fBest=FPS/best.period, ok=(Math.abs(predHz-fBest) <= REL_TOL*fBest);
   for(const t of tiles){ t.el.classList.toggle('pred', t===best && ok); }
   const guess = ok ? (stage==="row" ? `row:${best.row}` : best.label) : null;
 
@@ -256,18 +211,14 @@ function handlePrediction(predHz){
       if(stage==="row") enterKeyStage(best.row);
       else confirmSelection(best.label);
       refractoryUntil=now+REFRACTORY_MS; stableSince=0; lastGuess=null;
-      stageEnteredAt = performance.now(); // reinicia deadline da fase seguinte
     }
-  }else{
-    lastGuess=guess;
-    stableSince=guess?now:0;
-  }
+  }else{ lastGuess=guess; stableSince=guess?now:0; }
 }
 
 /* ===== Seleção ===== */
 function confirmSelection(label){
   const t=tiles.find(x=>x.active&&x.label===label&&x.row===rowIdx);
-  if(t){ t.el.classList.add('sel'); setTimeout(()=>t.el.classList.remove('sel'), 220); }
+  if(t){ t.el.classList.add('sel'); setTimeout(()=>t.el.classList.remove('sel'), 400); }
   if(label==="\u2190") typedEl.textContent=typedEl.textContent.slice(0,-1);
   else typedEl.textContent+=label;
   enterRowStage();
@@ -277,34 +228,35 @@ function confirmSelection(label){
 async function start(){
   if(running) return; running=true;
   bStart.disabled=true; bStop.disabled=false;
-  FPS=Math.round(await measureFPS(900)); fpsEl.textContent=FPS.toString();
+
+  FPS=Math.round(await measureFPS(900));
+  fpsEl.textContent=FPS.toString();
+
+  // Garante 5–40 Hz independentemente do FPS do monitor
+  // (linhas já estão OK para 60/120/144; mantemos elas)
+  KEY_PERIODS = buildKeyPeriods(10);
+
   enterRowStage(); loop(); if(!ws || ws.readyState>1) connectWS();
   updateHUD();
 }
 function stop(){
   if(!running) return; running=false;
   cancelAnimationFrame(anim); bStart.disabled=false; bStop.disabled=true;
-  if(autoTimer){ clearInterval(autoTimer); autoTimer=null; }
   for(const t of tiles){ t.el.classList.remove('on','pred','sel'); t.active=false; t.period=0; }
 }
 function updateHUD(){
   hud.innerHTML='';
   const mk=txt=>{ const s=document.createElement('span'); s.className='pill'; s.textContent=txt; return s; };
-  hud.append(mk(`Modo: ${MODE==='loose'?'TESTE (afrouxado)':'RÍGIDO'}`));
-  hud.append(mk(`Linhas (Hz): ${ROW_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ')}`));
-  hud.append(mk(`Teclas (Hz): ${KEY_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ')}`));
-  gatePill.textContent = `Confirmação: ${STABLE_MS/1000}s • Refratário: ${REFRACTORY_MS/1000}s • Tol: ${(REL_TOL*100)|0}%`;
+  const rowHz = ROW_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ');
+  const keyHz = KEY_PERIODS.map(p=>(FPS/p).toFixed(2)).join(', ');
+  hud.append(mk(`Faixa alvo: ${MIN_HZ}-${MAX_HZ} Hz`));
+  hud.append(mk(`Linhas (Hz): ${rowHz}`));
+  hud.append(mk(`Teclas (Hz): ${keyHz}`));
 }
 
 const bStart=document.getElementById('bStart');
 const bStop =document.getElementById('bStop');
-const bMode =document.getElementById('bMode');
-bStart.onclick=start; bStop.onclick=stop; bMode.onclick=()=>{ toggleMode(); updateHUD(); };
-
-// Toggle por teclado
-window.addEventListener('keydown', (e)=>{
-  if(e.key.toLowerCase()==='t'){ toggleMode(); updateHUD(); }
-});
+bStart.onclick=start; bStop.onclick=stop;
 
 // Tela cheia
 document.getElementById('bFS').onclick=()=>{
@@ -314,7 +266,5 @@ document.getElementById('bFS').onclick=()=>{
 };
 
 // boot
-buildKeyboard();
-setMode('strict'); // começa rígido
-reflow();
+buildKeyboard(); reflow();
 </script>
